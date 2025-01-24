@@ -1,5 +1,5 @@
 #include "progress-bar.hh"
-#include "util.hh"
+#include "terminal.hh"
 #include "sync.hh"
 #include "store-api.hh"
 #include "names.hh"
@@ -7,6 +7,7 @@
 #include <atomic>
 #include <map>
 #include <thread>
+#include <sstream>
 #include <iostream>
 #include <chrono>
 
@@ -72,8 +73,12 @@ private:
         uint64_t corruptedPaths = 0, untrustedPaths = 0;
 
         bool active = true;
+        bool paused = false;
         bool haveUpdate = true;
     };
+
+    /** Helps avoid unnecessary redraws, see `redraw()` */
+    Sync<std::string> lastOutput_;
 
     Sync<State> state_;
 
@@ -107,7 +112,8 @@ public:
         stop();
     }
 
-    void stop() override
+    /* Called by destructor, can't be overridden */
+    void stop() override final
     {
         {
             auto state(state_.lock());
@@ -120,37 +126,51 @@ public:
         updateThread.join();
     }
 
+    void pause() override {
+        auto state (state_.lock());
+        state->paused = true;
+        if (state->active)
+            writeToStderr("\r\e[K");
+    }
+
+    void resume() override {
+        auto state (state_.lock());
+        state->paused = false;
+        if (state->active)
+            writeToStderr("\r\e[K");
+        state->haveUpdate = true;
+        updateCV.notify_one();
+    }
+
     bool isVerbose() override
     {
         return printBuildLogs;
     }
 
-    void log(Verbosity lvl, const FormatOrString & fs) override
+    void log(Verbosity lvl, std::string_view s) override
     {
         if (lvl > verbosity) return;
         auto state(state_.lock());
-        log(*state, lvl, fs.s);
+        log(*state, lvl, s);
     }
 
     void logEI(const ErrorInfo & ei) override
     {
         auto state(state_.lock());
 
-        std::stringstream oss;
+        std::ostringstream oss;
         showErrorInfo(oss, ei, loggerSettings.showTrace.get());
 
-        log(*state, ei.level, oss.str());
+        log(*state, ei.level, toView(oss));
     }
 
-    void log(State & state, Verbosity lvl, const std::string & s)
+    void log(State & state, Verbosity lvl, std::string_view s)
     {
         if (state.active) {
             writeToStderr("\r\e[K" + filterANSIEscapes(s, !isTTY) + ANSI_NORMAL "\n");
             draw(state);
         } else {
-            auto s2 = s + ANSI_NORMAL "\n";
-            if (!isTTY) s2 = filterANSIEscapes(s2, true);
-            writeToStderr(s2);
+            writeToStderr(filterANSIEscapes(s, !isTTY) + "\n");
         }
     }
 
@@ -267,23 +287,21 @@ public:
 
         else if (type == resBuildLogLine || type == resPostBuildLogLine) {
             auto lastLine = chomp(getS(fields, 0));
-            if (!lastLine.empty()) {
-                auto i = state->its.find(act);
-                assert(i != state->its.end());
-                ActInfo info = *i->second;
-                if (printBuildLogs) {
-                    auto suffix = "> ";
-                    if (type == resPostBuildLogLine) {
-                        suffix = " (post)> ";
-                    }
-                    log(*state, lvlInfo, ANSI_FAINT + info.name.value_or("unnamed") + suffix + ANSI_NORMAL + lastLine);
-                } else {
-                    state->activities.erase(i->second);
-                    info.lastLine = lastLine;
-                    state->activities.emplace_back(info);
-                    i->second = std::prev(state->activities.end());
-                    update(*state);
+            auto i = state->its.find(act);
+            assert(i != state->its.end());
+            ActInfo info = *i->second;
+            if (printBuildLogs) {
+                auto suffix = "> ";
+                if (type == resPostBuildLogLine) {
+                    suffix = " (post)> ";
                 }
+                log(*state, lvlInfo, ANSI_FAINT + info.name.value_or("unnamed") + suffix + ANSI_NORMAL + lastLine);
+            } else {
+                state->activities.erase(i->second);
+                info.lastLine = lastLine;
+                state->activities.emplace_back(info);
+                i->second = std::prev(state->activities.end());
+                update(*state);
             }
         }
 
@@ -326,6 +344,14 @@ public:
             state->activitiesByType[type].expected += j;
             update(*state);
         }
+
+        else if (type == resFetchStatus) {
+            auto i = state->its.find(act);
+            assert(i != state->its.end());
+            ActInfo & actInfo = *i->second;
+            actInfo.lastLine = getS(fields, 0);
+            update(*state);
+        }
     }
 
     void update(State & state)
@@ -334,12 +360,28 @@ public:
         updateCV.notify_one();
     }
 
+    /**
+     * Redraw, if the output has changed.
+     *
+     * Excessive redrawing is noticable on slow terminals, and it interferes
+     * with text selection in some terminals, including libvte-based terminal
+     * emulators.
+     */
+    void redraw(std::string newOutput)
+    {
+        auto lastOutput(lastOutput_.lock());
+        if (newOutput != *lastOutput) {
+            writeToStderr(newOutput);
+            *lastOutput = std::move(newOutput);
+        }
+    }
+
     std::chrono::milliseconds draw(State & state)
     {
         auto nextWakeup = std::chrono::milliseconds::max();
 
         state.haveUpdate = false;
-        if (!state.active) return nextWakeup;
+        if (state.paused || !state.active) return nextWakeup;
 
         std::string line;
 
@@ -387,7 +429,7 @@ public:
         auto width = getWindowSize().second;
         if (width <= 0) width = std::numeric_limits<decltype(width)>::max();
 
-        writeToStderr("\r" + filterANSIEscapes(line, false, width) + ANSI_NORMAL + "\e[K");
+        redraw("\r" + filterANSIEscapes(line, false, width) + ANSI_NORMAL + "\e[K");
 
         return nextWakeup;
     }
@@ -497,9 +539,9 @@ public:
     std::optional<char> ask(std::string_view msg) override
     {
         auto state(state_.lock());
-        if (!state->active || !isatty(STDIN_FILENO)) return {};
+        if (!state->active) return {};
         std::cerr << fmt("\r\e[K%s ", msg);
-        auto s = trim(readLine(STDIN_FILENO));
+        auto s = trim(readLine(getStandardInput(), true));
         if (s.size() != 1) return {};
         draw(*state);
         return s[0];
@@ -513,7 +555,7 @@ public:
 
 Logger * makeProgressBar()
 {
-    return new ProgressBar(shouldANSI());
+    return new ProgressBar(isTTY());
 }
 
 void startProgressBar()

@@ -1,26 +1,29 @@
 #include "sqlite.hh"
 #include "globals.hh"
 #include "util.hh"
+#include "url.hh"
+#include "signals.hh"
 
 #include <sqlite3.h>
 
 #include <atomic>
+#include <thread>
 
 namespace nix {
 
-SQLiteError::SQLiteError(const char *path, const char *errMsg, int errNo, int extendedErrNo, int offset, hintformat && hf)
+SQLiteError::SQLiteError(const char *path, const char *errMsg, int errNo, int extendedErrNo, int offset, HintFmt && hf)
   : Error(""), path(path), errMsg(errMsg), errNo(errNo), extendedErrNo(extendedErrNo), offset(offset)
 {
     auto offsetStr = (offset == -1) ? "" : "at offset " + std::to_string(offset) + ": ";
-    err.msg = hintfmt("%s: %s%s, %s (in '%s')",
-        normaltxt(hf.str()),
+    err.msg = HintFmt("%s: %s%s, %s (in '%s')",
+        Uncolored(hf.str()),
         offsetStr,
         sqlite3_errstr(extendedErrNo),
         errMsg,
         path ? path : "(in-memory)");
 }
 
-[[noreturn]] void SQLiteError::throw_(sqlite3 * db, hintformat && hf)
+[[noreturn]] void SQLiteError::throw_(sqlite3 * db, HintFmt && hf)
 {
     int err = sqlite3_errcode(db);
     int exterr = sqlite3_extended_errcode(db);
@@ -31,7 +34,7 @@ SQLiteError::SQLiteError(const char *path, const char *errMsg, int errNo, int ex
 
     if (err == SQLITE_BUSY || err == SQLITE_PROTOCOL) {
         auto exp = SQLiteBusy(path, errMsg, err, exterr, offset, std::move(hf));
-        exp.err.msg = hintfmt(
+        exp.err.msg = HintFmt(
             err == SQLITE_PROTOCOL
                 ? "SQLite database '%s' is busy (SQLITE_PROTOCOL)"
                 : "SQLite database '%s' is busy",
@@ -41,15 +44,26 @@ SQLiteError::SQLiteError(const char *path, const char *errMsg, int errNo, int ex
         throw SQLiteError(path, errMsg, err, exterr, offset, std::move(hf));
 }
 
-SQLite::SQLite(const Path & path, bool create)
+static void traceSQL(void * x, const char * sql)
+{
+    // wacky delimiters:
+    //   so that we're quite unambiguous without escaping anything
+    // notice instead of trace:
+    //   so that this can be enabled without getting the firehose in our face.
+    notice("SQL<[%1%]>", sql);
+};
+
+SQLite::SQLite(const Path & path, SQLiteOpenMode mode)
 {
     // useSQLiteWAL also indicates what virtual file system we need.  Using
     // `unix-dotfile` is needed on NFS file systems and on Windows' Subsystem
     // for Linux (WSL) where useSQLiteWAL should be false by default.
     const char *vfs = settings.useSQLiteWAL ? 0 : "unix-dotfile";
-    int flags = SQLITE_OPEN_READWRITE;
-    if (create) flags |= SQLITE_OPEN_CREATE;
-    int ret = sqlite3_open_v2(path.c_str(), &db, flags, vfs);
+    bool immutable = mode == SQLiteOpenMode::Immutable;
+    int flags = immutable ? SQLITE_OPEN_READONLY : SQLITE_OPEN_READWRITE;
+    if (mode == SQLiteOpenMode::Normal) flags |= SQLITE_OPEN_CREATE;
+    auto uri = "file:" + percentEncode(path) + "?immutable=" + (immutable ? "1" : "0");
+    int ret = sqlite3_open_v2(uri.c_str(), &db, SQLITE_OPEN_URI | flags, vfs);
     if (ret != SQLITE_OK) {
         const char * err = sqlite3_errstr(ret);
         throw Error("cannot open SQLite database '%s': %s", path, err);
@@ -57,6 +71,11 @@ SQLite::SQLite(const Path & path, bool create)
 
     if (sqlite3_busy_timeout(db, 60 * 60 * 1000) != SQLITE_OK)
         SQLiteError::throw_(db, "setting timeout");
+
+    if (getEnv("NIX_DEBUG_SQLITE_TRACES") == "1") {
+        // To debug sqlite statements; trace all of them
+        sqlite3_trace(db, &traceSQL, nullptr);
+    }
 
     exec("pragma foreign_keys = 1");
 }
@@ -67,7 +86,7 @@ SQLite::~SQLite()
         if (db && sqlite3_close(db) != SQLITE_OK)
             SQLiteError::throw_(db, "closing database");
     } catch (...) {
-        ignoreException();
+        ignoreExceptionInDestructor();
     }
 }
 
@@ -106,7 +125,7 @@ SQLiteStmt::~SQLiteStmt()
         if (stmt && sqlite3_finalize(stmt) != SQLITE_OK)
             SQLiteError::throw_(db, "finalizing statement '%s'", sql);
     } catch (...) {
-        ignoreException();
+        ignoreExceptionInDestructor();
     }
 }
 
@@ -221,30 +240,25 @@ SQLiteTxn::~SQLiteTxn()
         if (active && sqlite3_exec(db, "rollback;", 0, 0, 0) != SQLITE_OK)
             SQLiteError::throw_(db, "aborting transaction");
     } catch (...) {
-        ignoreException();
+        ignoreExceptionInDestructor();
     }
 }
 
-void handleSQLiteBusy(const SQLiteBusy & e)
+void handleSQLiteBusy(const SQLiteBusy & e, time_t & nextWarning)
 {
-    static std::atomic<time_t> lastWarned{0};
-
     time_t now = time(0);
-
-    if (now > lastWarned + 10) {
-        lastWarned = now;
+    if (now > nextWarning) {
+        nextWarning = now + 10;
         logWarning({
-            .msg = hintfmt(e.what())
+            .msg = HintFmt(e.what())
         });
     }
 
     /* Sleep for a while since retrying the transaction right away
        is likely to fail again. */
     checkInterrupt();
-    struct timespec t;
-    t.tv_sec = 0;
-    t.tv_nsec = (random() % 100) * 1000 * 1000; /* <= 0.1s */
-    nanosleep(&t, 0);
+    /* <= 0.1s */
+    std::this_thread::sleep_for(std::chrono::milliseconds { rand() % 100 });
 }
 
 }

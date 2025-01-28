@@ -23,11 +23,11 @@ readonly RED='\033[31m'
 # installer allows overriding build user count to speed up installation
 # as creating each user takes non-trivial amount of time on macos
 readonly NIX_USER_COUNT=${NIX_USER_COUNT:-32}
-readonly NIX_BUILD_GROUP_ID="${NIX_BUILD_GROUP_ID:-30000}"
 readonly NIX_BUILD_GROUP_NAME="nixbld"
-# darwin installer needs to override these
-NIX_FIRST_BUILD_UID="${NIX_FIRST_BUILD_UID:-30001}"
-NIX_BUILD_USER_NAME_TEMPLATE="nixbld%d"
+# each system specific installer must set these:
+#   NIX_FIRST_BUILD_UID
+#   NIX_BUILD_GROUP_ID
+#   NIX_BUILD_USER_NAME_TEMPLATE
 # Please don't change this. We don't support it, because the
 # default shell profile that comes with Nix doesn't support it.
 readonly NIX_ROOT="/nix"
@@ -55,6 +55,9 @@ readonly NIX_INSTALLED_CACERT="@cacert@"
 #readonly NIX_INSTALLED_NIX="/nix/store/j8dbv5w6jl34caywh2ygdy88knx1mdf7-nix-2.3.6"
 #readonly NIX_INSTALLED_CACERT="/nix/store/7dxhzymvy330i28ii676fl1pqwcahv2f-nss-cacert-3.49.2"
 readonly EXTRACTED_NIX_PATH="$(dirname "$0")"
+
+# allow to override identity change command
+readonly NIX_BECOME=${NIX_BECOME:-sudo}
 
 readonly ROOT_HOME=~root
 
@@ -123,7 +126,7 @@ uninstall_directions() {
             cat <<EOF
 $step. Restore $profile_target$PROFILE_BACKUP_SUFFIX back to $profile_target
 
-  sudo mv $profile_target$PROFILE_BACKUP_SUFFIX $profile_target
+  $NIX_BECOME mv $profile_target$PROFILE_BACKUP_SUFFIX $profile_target
 
 (after this one, you may need to re-open any terminals that were
 opened while it existed.)
@@ -136,7 +139,7 @@ EOF
     cat <<EOF
 $step. Delete the files Nix added to your system:
 
-  sudo rm -rf /etc/nix $NIX_ROOT $ROOT_HOME/.nix-profile $ROOT_HOME/.nix-defexpr $ROOT_HOME/.nix-channels $HOME/.nix-profile $HOME/.nix-defexpr $HOME/.nix-channels
+  $NIX_BECOME rm -rf "/etc/nix" "$NIX_ROOT" "$ROOT_HOME/.nix-profile" "$ROOT_HOME/.nix-defexpr" "$ROOT_HOME/.nix-channels" "$ROOT_HOME/.local/state/nix" "$ROOT_HOME/.cache/nix" "$HOME/.nix-profile" "$HOME/.nix-defexpr" "$HOME/.nix-channels" "$HOME/.local/state/nix" "$HOME/.cache/nix"
 
 and that is it.
 
@@ -246,8 +249,15 @@ printf -v _OLD_LINE_FMT "%b" $'\033[1;7;31m-'"$ESC ${RED}%L${ESC}"
 printf -v _NEW_LINE_FMT "%b" $'\033[1;7;32m+'"$ESC ${GREEN}%L${ESC}"
 
 _diff() {
+    # macOS Ventura doesn't ship with GNU diff. Print similar output except
+    # without +/- markers or dimming
+    if diff --version | grep -q "Apple diff"; then
+        printf -v CHANGED_GROUP_FORMAT "%b" "${GREEN}%>${RED}%<${ESC}"
+        diff --changed-group-format="$CHANGED_GROUP_FORMAT" "$@"
+    else
     # simple colorized diff comatible w/ pre `--color` versions
-    diff --unchanged-group-format="$_UNCHANGED_GRP_FMT" --old-line-format="$_OLD_LINE_FMT" --new-line-format="$_NEW_LINE_FMT" --unchanged-line-format="  %L" "$@"
+        diff --unchanged-group-format="$_UNCHANGED_GRP_FMT" --old-line-format="$_OLD_LINE_FMT" --new-line-format="$_NEW_LINE_FMT" --unchanged-line-format="  %L" "$@"
+    fi
 }
 
 confirm_rm() {
@@ -336,7 +346,7 @@ __sudo() {
 
     echo "I am executing:"
     echo ""
-    printf "    $ sudo %s\\n" "$cmd"
+    printf "    $ $NIX_BECOME %s\\n" "$cmd"
     echo ""
     echo "$expl"
     echo ""
@@ -354,7 +364,9 @@ _sudo() {
     if is_root; then
         env "$@"
     else
-        sudo "$@"
+        # env sets environment variables for sudo alternatives
+        # that don't support "VAR=value command" syntax
+        $NIX_BECOME env "$@"
     fi
 }
 
@@ -445,6 +457,14 @@ EOF
         #       a row for different files.
         if [ -e "$profile_target$PROFILE_BACKUP_SUFFIX" ]; then
             # this backup process first released in Nix 2.1
+
+            if diff -q "$profile_target$PROFILE_BACKUP_SUFFIX" "$profile_target" > /dev/null; then
+                # a backup file for the rc-file exist, but they are identical,
+                # so we can safely ignore it and overwrite it with the same
+                # content later
+                continue
+            fi
+
             failure <<EOF
 I back up shell profile/rc scripts before I add Nix to them.
 I need to back up $profile_target to $profile_target$PROFILE_BACKUP_SUFFIX,
@@ -515,9 +535,7 @@ It seems the build group $NIX_BUILD_GROUP_NAME already exists, but
 with the UID $primary_group_id. This script can't really handle
 that right now, so I'm going to give up.
 
-You can fix this by editing this script and changing the
-NIX_BUILD_GROUP_ID variable near the top to from $NIX_BUILD_GROUP_ID
-to $primary_group_id and re-run.
+You can export NIX_BUILD_GROUP_ID=$primary_group_id and re-run.
 EOF
         else
             row "            Exists" "Yes"
@@ -544,7 +562,7 @@ create_build_user_for_core() {
         if [ "$actual_uid" != "$uid" ]; then
             failure <<EOF
 It seems the build user $username already exists, but with the UID
-with the UID '$actual_uid'. This script can't really handle that right
+'$actual_uid'. This script can't really handle that right
 now, so I'm going to give up.
 
 If you already created the users and you know they start from
@@ -677,7 +695,7 @@ place_channel_configuration() {
     if [ -z "${NIX_INSTALLER_NO_CHANNEL_ADD:-}" ]; then
         echo "https://nixos.org/channels/nixpkgs-unstable nixpkgs" > "$SCRATCH/.nix-channels"
         _sudo "to set up the default system channel (part 1)" \
-            install -m 0664 "$SCRATCH/.nix-channels" "$ROOT_HOME/.nix-channels"
+            install -m 0644 "$SCRATCH/.nix-channels" "$ROOT_HOME/.nix-channels"
     fi
 }
 
@@ -692,7 +710,17 @@ EOF
     fi
 }
 
+check_required_system_specific_settings() {
+    if [ -z "${NIX_FIRST_BUILD_UID+x}" ] || [ -z "${NIX_BUILD_USER_NAME_TEMPLATE+x}" ]; then
+        failure "Internal error: System specific installer for $(uname) ($1) does not export required settings."
+    fi
+}
+
 welcome_to_nix() {
+    local -r NIX_UID_RANGES="${NIX_FIRST_BUILD_UID}..$((NIX_FIRST_BUILD_UID + NIX_USER_COUNT - 1))"
+    local -r RANGE_TEXT=$(echo -ne "${BLUE}(uids [${NIX_UID_RANGES}])${ESC}")
+    local -r GROUP_TEXT=$(echo -ne "${BLUE}(gid ${NIX_BUILD_GROUP_ID})${ESC}")
+
     ok "Welcome to the Multi-User Nix Installation"
 
     cat <<EOF
@@ -706,8 +734,10 @@ manager. This will happen in a few stages:
 2. Show you what I am going to install and where. Then I will ask
    if you are ready to continue.
 
-3. Create the system users and groups that the Nix daemon uses to run
-   builds.
+3. Create the system users ${RANGE_TEXT} and groups ${GROUP_TEXT}
+   that the Nix daemon uses to run builds. To create system users
+   in a different range, exit and run this tool again with
+   NIX_FIRST_BUILD_UID set.
 
 4. Perform the basic installation of the Nix files daemon.
 
@@ -727,7 +757,7 @@ I will:
    (if it does, I will tell you how to clean them up.)
  - create local users (see the list above for the users I'll make)
  - create a local group ($NIX_BUILD_GROUP_NAME)
- - install Nix in to $NIX_ROOT
+ - install Nix in $NIX_ROOT
  - create a configuration file in /etc/nix
  - set up the "default profile" by creating some Nix-related files in
    $ROOT_HOME
@@ -873,7 +903,7 @@ configure_shell_profile() {
         fi
     done
 
-    task "Setting up shell profiles for Fish with with ${PROFILE_FISH_SUFFIX} inside ${PROFILE_FISH_PREFIXES[*]}"
+    task "Setting up shell profiles for Fish with ${PROFILE_FISH_SUFFIX} inside ${PROFILE_FISH_PREFIXES[*]}"
     for fish_prefix in "${PROFILE_FISH_PREFIXES[@]}"; do
         if [ ! -d "$fish_prefix" ]; then
             # this specific prefix (ie: /etc/fish) is very likely to exist
@@ -939,7 +969,7 @@ $NIX_EXTRA_CONF
 build-users-group = $NIX_BUILD_GROUP_NAME
 EOF
     _sudo "to place the default nix daemon configuration (part 2)" \
-          install -m 0664 "$SCRATCH/nix.conf" /etc/nix/nix.conf
+          install -m 0644 "$SCRATCH/nix.conf" /etc/nix/nix.conf
 }
 
 
@@ -949,12 +979,15 @@ main() {
     if is_os_darwin; then
         # shellcheck source=./install-darwin-multi-user.sh
         . "$EXTRACTED_NIX_PATH/install-darwin-multi-user.sh"
+        check_required_system_specific_settings "install-darwin-multi-user.sh"
     elif is_os_linux; then
         # shellcheck source=./install-systemd-multi-user.sh
         . "$EXTRACTED_NIX_PATH/install-systemd-multi-user.sh" # most of this works on non-systemd distros also
+        check_required_system_specific_settings "install-systemd-multi-user.sh"
     else
         failure "Sorry, I don't know what to do on $(uname)"
     fi
+
 
     welcome_to_nix
 

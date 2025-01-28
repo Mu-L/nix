@@ -1,5 +1,6 @@
-{ binaryTarballs
-, nixpkgsFor
+{
+  binaryTarballs,
+  nixpkgsFor,
 }:
 
 let
@@ -13,11 +14,22 @@ let
       '';
     };
 
+    install-both-profile-links = {
+      script = ''
+        tar -xf ./nix.tar.xz
+        mv ./nix-* nix
+        ln -s $HOME/.local/state/nix/profiles/a-profile $HOME/.nix-profile
+        mkdir -p $HOME/.local/state/nix
+        ln -s $HOME/.local/state/nix/profiles/b-profile $HOME/.local/state/nix/profile
+        ./nix/install --no-channel-add
+      '';
+    };
+
     install-force-no-daemon = {
       script = ''
         tar -xf ./nix.tar.xz
         mv ./nix-* nix
-        ./nix/install --no-daemon
+        ./nix/install --no-daemon --no-channel-add
       '';
     };
 
@@ -30,19 +42,28 @@ let
     };
   };
 
+  mockChannel =
+    pkgs:
+    pkgs.runCommandNoCC "mock-channel" { } ''
+      mkdir nixexprs
+      mkdir -p $out/channel
+      echo -n 'someContent' > nixexprs/someFile
+      tar cvf - nixexprs | bzip2 > $out/channel/nixexprs.tar.bz2
+    '';
+
   disableSELinux = "sudo setenforce 0";
 
   images = {
 
     /*
-    "ubuntu-14-04" = {
-      image = import <nix/fetchurl.nix> {
-        url = "https://app.vagrantup.com/ubuntu/boxes/trusty64/versions/20190514.0.0/providers/virtualbox.box";
-        hash = "sha256-iUUXyRY8iW7DGirb0zwGgf1fRbLA7wimTJKgP7l/OQ8=";
+      "ubuntu-14-04" = {
+        image = import <nix/fetchurl.nix> {
+          url = "https://app.vagrantup.com/ubuntu/boxes/trusty64/versions/20190514.0.0/providers/virtualbox.box";
+          hash = "sha256-iUUXyRY8iW7DGirb0zwGgf1fRbLA7wimTJKgP7l/OQ8=";
+        };
+        rootDisk = "box-disk1.vmdk";
+        system = "x86_64-linux";
       };
-      rootDisk = "box-disk1.vmdk";
-      system = "x86_64-linux";
-    };
     */
 
     "ubuntu-16-04" = {
@@ -76,14 +97,14 @@ let
     # Currently fails with 'error while loading shared libraries:
     # libsodium.so.23: cannot stat shared object: Invalid argument'.
     /*
-    "rhel-6" = {
-      image = import <nix/fetchurl.nix> {
-        url = "https://app.vagrantup.com/generic/boxes/rhel6/versions/4.1.12/providers/libvirt.box";
-        hash = "sha256-QwzbvRoRRGqUCQptM7X/InRWFSP2sqwRt2HaaO6zBGM=";
+      "rhel-6" = {
+        image = import <nix/fetchurl.nix> {
+          url = "https://app.vagrantup.com/generic/boxes/rhel6/versions/4.1.12/providers/libvirt.box";
+          hash = "sha256-QwzbvRoRRGqUCQptM7X/InRWFSP2sqwRt2HaaO6zBGM=";
+        };
+        rootDisk = "box.img";
+        system = "x86_64-linux";
       };
-      rootDisk = "box.img";
-      system = "x86_64-linux";
-    };
     */
 
     "rhel-7" = {
@@ -118,12 +139,18 @@ let
 
   };
 
-  makeTest = imageName: testName:
-    let image = images.${imageName}; in
-    with nixpkgsFor.${image.system};
-    runCommand
-      "installer-test-${imageName}-${testName}"
-      { buildInputs = [ qemu_kvm openssh ];
+  makeTest =
+    imageName: testName:
+    let
+      image = images.${imageName};
+    in
+    with nixpkgsFor.${image.system}.native;
+    runCommand "installer-test-${imageName}-${testName}"
+      {
+        buildInputs = [
+          qemu_kvm
+          openssh
+        ];
         image = image.image;
         postBoot = image.postBoot or "";
         installScript = installScripts.${testName}.script;
@@ -189,6 +216,11 @@ let
         echo "Running installer..."
         $ssh "set -eux; $installScript"
 
+        echo "Copying the mock channel"
+        # `scp -r` doesn't seem to work properly on some rhel instances, so let's
+        # use a plain tarpipe instead
+        tar -C ${mockChannel pkgs} -c channel | ssh -p 20022 $ssh_opts vagrant@localhost tar x -f-
+
         echo "Testing Nix installation..."
         $ssh <<EOF
           set -ex
@@ -200,10 +232,21 @@ let
           source /etc/bashrc || true
 
           nix-env --version
-          nix --extra-experimental-features nix-command store ping
+          nix --extra-experimental-features nix-command store info
 
           out=\$(nix-build --no-substitute -E 'derivation { name = "foo"; system = "x86_64-linux"; builder = "/bin/sh"; args = ["-c" "echo foobar > \$out"]; }')
           [[ \$(cat \$out) = foobar ]]
+
+          if pgrep nix-daemon; then
+            MAYBESUDO="sudo"
+          else
+            MAYBESUDO=""
+          fi
+
+
+          $MAYBESUDO \$(which nix-channel) --add file://\$HOME/channel myChannel
+          $MAYBESUDO \$(which nix-channel) --update
+          [[ \$(nix-instantiate --eval --expr 'builtins.readFile <myChannel/someFile>') = '"someContent"' ]]
         EOF
 
         echo "Done!"
@@ -212,9 +255,6 @@ let
 
 in
 
-builtins.mapAttrs (imageName: image:
-  { ${image.system} = builtins.mapAttrs (testName: test:
-      makeTest imageName testName
-    ) installScripts;
-  }
-) images
+builtins.mapAttrs (imageName: image: {
+  ${image.system} = builtins.mapAttrs (testName: test: makeTest imageName testName) installScripts;
+}) images

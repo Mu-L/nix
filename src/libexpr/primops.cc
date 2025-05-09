@@ -4311,9 +4311,7 @@ struct RegexCache
 {
     struct State
     {
-        // TODO use C++20 transparent comparison when available
-        std::unordered_map<std::string_view, std::regex> cache;
-        std::list<std::string> keys;
+        std::unordered_map<std::string, std::regex, StringViewHash, std::equal_to<>> cache;
     };
 
     Sync<State> state_;
@@ -4324,8 +4322,14 @@ struct RegexCache
         auto it = state->cache.find(re);
         if (it != state->cache.end())
             return it->second;
-        state->keys.emplace_back(re);
-        return state->cache.emplace(state->keys.back(), std::regex(state->keys.back(), std::regex::extended)).first->second;
+        /* No std::regex constructor overload from std::string_view, but can be constructed
+           from a pointer + size or an iterator range. */
+        return state->cache
+            .emplace(
+                std::piecewise_construct,
+                std::forward_as_tuple(re),
+                std::forward_as_tuple(/*s=*/re.data(), /*count=*/re.size(), std::regex::extended))
+            .first->second;
     }
 };
 
@@ -4709,13 +4713,9 @@ static RegisterPrimOp primop_splitVersion({
  *************************************************************/
 
 
-RegisterPrimOp::PrimOps * RegisterPrimOp::primOps;
-
-
 RegisterPrimOp::RegisterPrimOp(PrimOp && primOp)
 {
-    if (!primOps) primOps = new PrimOps;
-    primOps->push_back(std::move(primOp));
+    primOps().push_back(std::move(primOp));
 }
 
 
@@ -4969,14 +4969,12 @@ void EvalState::createBaseEnv(const EvalSettings & evalSettings)
         )",
     });
 
-    if (RegisterPrimOp::primOps)
-        for (auto & primOp : *RegisterPrimOp::primOps)
-            if (experimentalFeatureSettings.isEnabled(primOp.experimentalFeature))
-            {
-                auto primOpAdjusted = primOp;
-                primOpAdjusted.arity = std::max(primOp.args.size(), primOp.arity);
-                addPrimOp(std::move(primOpAdjusted));
-            }
+    for (auto & primOp : RegisterPrimOp::primOps())
+        if (experimentalFeatureSettings.isEnabled(primOp.experimentalFeature)) {
+            auto primOpAdjusted = primOp;
+            primOpAdjusted.arity = std::max(primOp.args.size(), primOp.arity);
+            addPrimOp(std::move(primOpAdjusted));
+        }
 
     for (auto & primOp : evalSettings.extraPrimOps) {
         auto primOpAdjusted = primOp;

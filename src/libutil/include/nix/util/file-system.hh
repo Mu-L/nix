@@ -126,26 +126,8 @@ std::optional<struct stat> maybeLstat(const Path & path);
 
 /**
  * @return true iff the given path exists.
- *
- * In the process of being deprecated for `fs::symlink_exists`.
  */
-bool pathExists(const Path & path);
-
-namespace fs {
-
-/**
- * TODO: we may actually want to use pathExists instead of this function
- *  ```
- *  symlink_exists(p) = std::filesystem::exists(std::filesystem::symlink_status(p))
- *  ```
- *  Missing convenience analogous to
- *  ```
- *  std::filesystem::exists(p) = std::filesystem::exists(std::filesystem::status(p))
- *  ```
- */
-bool symlink_exists(const std::filesystem::path & path);
-
-} // namespace fs
+bool pathExists(const std::filesystem::path & path);
 
 /**
  * Canonicalize a path except for the last component.
@@ -191,7 +173,7 @@ Descriptor openDirectory(const std::filesystem::path & path);
  */
 std::string readFile(const Path & path);
 std::string readFile(const std::filesystem::path & path);
-void readFile(const Path & path, Sink & sink);
+void readFile(const Path & path, Sink & sink, bool memory_map = true);
 
 /**
  * Write a string to a file.
@@ -375,5 +357,65 @@ extern PathFilter defaultPathFilter;
  * @return true if permissions changed, false otherwise.
  */
 bool chmodIfNeeded(const std::filesystem::path & path, mode_t mode, mode_t mask = S_IRWXU | S_IRWXG | S_IRWXO);
+
+/**
+  * @brief A directory iterator that can be used to iterate over the
+  * contents of a directory. It is similar to std::filesystem::directory_iterator
+  * but throws NixError on failure instead of std::filesystem::filesystem_error.
+  */
+class DirectoryIterator {
+public:
+    // --- Iterator Traits ---
+    using iterator_category = std::input_iterator_tag;
+    using value_type        = std::filesystem::directory_entry;
+    using difference_type   = std::ptrdiff_t;
+    using pointer           = const std::filesystem::directory_entry*;
+    using reference         = const std::filesystem::directory_entry&;
+
+    // Default constructor (represents end iterator)
+    DirectoryIterator() noexcept = default;
+
+    // Constructor taking a path
+    explicit DirectoryIterator(const std::filesystem::path& p);
+
+    reference operator*() const {
+        // Accessing the value itself doesn't typically throw filesystem_error
+        // after successful construction/increment, but underlying operations might.
+        // If directory_entry methods called via -> could throw, add try-catch there.
+        return *it_;
+    }
+
+    pointer operator->() const {
+        return &(*it_);
+    }
+
+
+    DirectoryIterator& operator++();
+
+    // Postfix increment operator
+    DirectoryIterator operator++(int) {
+        DirectoryIterator temp = *this;
+        ++(*this); // Uses the prefix increment's try-catch logic
+        return temp;
+    }
+
+    // Equality comparison
+    friend bool operator==(const DirectoryIterator& a, const DirectoryIterator& b) noexcept {
+        return a.it_ == b.it_;
+    }
+
+    // Inequality comparison
+    friend bool operator!=(const DirectoryIterator& a, const DirectoryIterator& b) noexcept {
+        return !(a == b);
+    }
+
+    // Allow direct use in range-based for loops if iterating over an instance
+    DirectoryIterator begin() const { return *this; }
+    DirectoryIterator end() const { return DirectoryIterator{}; }
+
+
+private:
+    std::filesystem::directory_iterator it_;
+};
 
 }

@@ -285,13 +285,16 @@ struct StorePathCommand : public StorePathsCommand
 struct RegisterCommand
 {
     typedef std::map<std::vector<std::string>, std::function<ref<Command>()>> Commands;
-    static Commands * commands;
+
+    static Commands & commands()
+    {
+        static Commands commands;
+        return commands;
+    }
 
     RegisterCommand(std::vector<std::string> && name, std::function<ref<Command>()> command)
     {
-        if (!commands)
-            commands = new Commands;
-        commands->emplace(name, command);
+        commands().emplace(name, command);
     }
 
     static nix::Commands getCommandsFor(const std::vector<std::string> & prefix);
@@ -363,7 +366,7 @@ void completeFlakeRefWithFragment(
     const Strings & defaultFlakeAttrPaths,
     std::string_view prefix);
 
-std::string showVersions(const std::set<std::string> & versions);
+std::string showVersions(const StringSet & versions);
 
 void printClosureDiff(
     ref<Store> store, const StorePath & beforePath, const StorePath & afterPath, std::string_view indent);

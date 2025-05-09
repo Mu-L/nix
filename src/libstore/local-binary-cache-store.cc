@@ -84,7 +84,7 @@ protected:
     {
         StorePathSet paths;
 
-        for (auto & entry : std::filesystem::directory_iterator{binaryCacheDir}) {
+        for (auto & entry : DirectoryIterator{binaryCacheDir}) {
             checkInterrupt();
             auto name = entry.path().filename().string();
             if (name.size() != 40 ||
@@ -119,7 +119,7 @@ bool LocalBinaryCacheStore::fileExists(const std::string & path)
     return pathExists(binaryCacheDir + "/" + path);
 }
 
-std::set<std::string> LocalBinaryCacheStoreConfig::uriSchemes()
+StringSet LocalBinaryCacheStoreConfig::uriSchemes()
 {
     if (getEnv("_NIX_FORCE_HTTP") == "1")
         return {};

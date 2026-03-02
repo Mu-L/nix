@@ -1,8 +1,8 @@
 #include "nix/util/environment-variables.hh"
 
 #ifdef _WIN32
-#  include "processenv.h"
-#  include "shlwapi.h"
+#  include <processenv.h>
+#  include <shlwapi.h>
 
 namespace nix {
 
